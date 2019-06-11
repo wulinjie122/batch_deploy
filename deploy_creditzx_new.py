@@ -4,6 +4,7 @@ from logging.handlers import RotatingFileHandler
 import pexpect
 import simplejson as json
 from pexpect.popen_spawn import PopenSpawn
+from host import Host
 
 copyr = """
 ***********************************************************
@@ -31,19 +32,13 @@ logging.getLogger('').addHandler(Rthandler)
 # logging.info('This is info message')
 # logging.warning('This is warning message')
 
-# 命令列表
-cmdList = {
-    'creditzx-job-reboot-dev': [
-        'fuser -k 8888/tcp',
-        #'JARFILE=$(find ~/project/creditzx/creditzx-job/target -name "creditzx-job*.jar" | xargs awk \'END{ var=FILENAME; n=split (var,a,/\//); print a[n]}\')',
-        'cd /root/deployer/creditzx',
-        'nohup java -Dapollo.bootstrap.namespaces=creditzx-job -Dapollo.bootstrap.enabled=true -Dapp.id=9f84cc5e3294333b95d03b3f5de3d99e -jar creditzx-job-1.0-SNAPSHOT.jar > /dev/null 2>&1'
-    ]
-}
 
+# 开发环境重启
+def devReboot(handle):
+    pass
 
 # 批量执行命令
-def reboot(ctype):
+def runCmd(ctype, appName):
     with open('config/server.js') as config_file:
         config = json.load(config_file)
 
@@ -57,20 +52,23 @@ def reboot(ctype):
         hostConfig = config['test']
         env = hostConfig['env']
 
+    # 解析环境
+    hostList = []
     for host in hostConfig['hosts']:
+        # 初始化主机实例
+        item = Host(host['ip'],  host['port'], host['username'], host['password'], host['path'], host['apollo.bootstrap.namespaces'], host['app.id']);
+        # 追加到主机列表
+        hostList.append(item)
+
+    for host in hostList:
         ssh_newkey = 'Are you sure you want to continue connecting'
-        ip = host['ip']
-        port = host['port']
-        userName = host['username']
-        password = host['password']
-        namespaces = host['apollo.bootstrap.namespaces']
-        appId = host['app.id']
-        path = host['path']
 
-        logging.info('ENV: %s, Host: %s' % (env, ip))
 
+        logging.info('ENV: %s, Host: %s' % (env, host.getIp()))
+
+        # 首先登陆到服务器
         #child = pexpect.popen_spawn.PopenSpawn('ssh %s@%s' % (userName, ip))
-        child = pexpect.popen_spawn.PopenSpawn('ssh -tt %s@%s' % (userName, ip))
+        child = pexpect.popen_spawn.PopenSpawn('ssh -tt %s@%s' % (host.getUserName(), host.getIp()))
         i = child.expect([pexpect.TIMEOUT, ssh_newkey, 'password: ', '[#\$] '])
         if (i == 0):
             logging.error('SSH could not login. Here is what SSH said:')
@@ -80,36 +78,45 @@ def reboot(ctype):
         elif (i == 1):
             child.sendline('yes')
             child.expect('password: ')
-            child.sendline(password)
+            child.sendline(host.getPassword())
             logging.info('1.login successfully')
             # return child
 
         elif (i == 2):
-            child.sendline(password)
+            child.sendline(host.getPassword())
             logging.info('2.login successfully')
 
-        logging.info('关闭服务端口: %s' % (port))
-        child.sendline('fuser -k %s/tcp' % (port))
-        child.expect(['8888/tcp', '[#\$] '])
-        #print(child.before)
+        # 登陆成功后，关闭服务端口
+        logging.info('关闭服务端口: %s' % (host.getPort()))
+        child.sendline('fuser -k %s/tcp' % (host.getPort()))
+        child.expect([str(host.getPort()) + '/tcp', '[#\$] '])
+        # print(child.before)
 
-        logging.info('开始重启服务, ENV: %s, Host: %s' % (env, ip))
-        child.sendline('find ~/project/creditzx/creditzx-job/target -name "creditzx-job*.jar" | xargs awk \'END{ var=FILENAME; n=split (var,a,/\//); print a[n]}\'')
+        # 重新打包部署
+        logging.info('开始重启服务, 环境: %s, 主机: %s' % (env, host.getIp()))
+        child.sendline(
+            'find ~/project/creditzx/%s/target -name "%s*.jar" | xargs awk \'END{ var=FILENAME; n=split (var,a,/\//); print a[n]}\'' % (
+                appName, appName))
         child.expect(['creditzx-job-1.0-SNAPSHOT.jar', pexpect.EOF], timeout=30)
         jar = child.after.decode("utf-8")
-        child.sendline('cd %s' % (path))
-        child.sendline('nohup java -Dapollo.bootstrap.namespaces=%s -Dapollo.bootstrap.enabled=true -Dapp.id=%s -jar %s > /dev/null 2>&1 & tail -f /data/logs/tomcat/creditzx-job.log' % (namespaces, appId, jar))
+        child.sendline('cd %s' % (host.getPath()))
+        child.sendline(
+            'nohup java -Dapollo.bootstrap.namespaces=%s -Dapollo.bootstrap.enabled=true -Dapp.id=%s -jar %s > /dev/null 2>&1 & tail -f /data/logs/tomcat/%s.log' % (
+                host.getNamespaces(), host.getAppId(), jar, appName))
         while True:
             try:
-                child.expect('\n')
-                print(child.before.decode("utf-8"))
+                i = child.expect(['\n', pexpect.EOF, pexpect.TIMEOUT], timeout=5)
+                if i == 0:
+                    print(child.before.decode("utf-8"))
+                else:
+                    break
             except pexpect.EOF:
                 break
-        #child.close()
-        logging.info('服务器[%s]执行命令完毕' % (ip))
 
+        logging.info('服务器[%s]执行命令完毕' % (host.getIp()))
+        # child.close()
 
-
+# main函数
 def main():
     env = int(input('请选择部署环境: \n 1-DEV \n 2-TEST \n'))
     dtype = int(input('请选择要执行的命令:\n\
@@ -124,7 +131,11 @@ def main():
                   9-关闭creditzx-api服务\n'))
 
     if (dtype == 1):
-        reboot(env)
+        runCmd(env, 'creditzx-job')
+    elif(dtype == 2):
+        runCmd(env, 'creditzx-web')
+    elif(dtype == 3):
+        runCmd(env, 'creditzx-api')
 
 if __name__ == '__main__':
     main()
